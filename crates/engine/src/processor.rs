@@ -2,26 +2,28 @@
 //!
 //! Real-time rules enforced here: no allocation, no locks, no I/O in `process_*`.
 //! All state changes arrive through the lock-free command queue and all
-//! results leave through the event queue.
+//! results leave through the event queue. Anything that must be freed is sent back
+//! to the control thread as `Retired`.
 
-use crate::clip::Clip;
 use crate::dsp::{soft_limit, Click};
-use crate::messages::{Command, Event, StatusSnapshot};
+use crate::messages::{Command, Event, Retired, StatusSnapshot, TrackMeter, MAX_TRACKS};
 use crate::midi::MidiEvent;
-use crate::params::{ParamId, ParamSet};
-use crate::synth::{Synth, CHUNK};
+use crate::synth::CHUNK;
+use crate::track::{Slot, Track};
 use crate::PPQ;
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use std::time::Instant;
 
 const COMMAND_QUEUE: usize = 4096;
 const EVENT_QUEUE: usize = 8192;
-const MAX_SCHED: usize = 512;
+const MAX_SCHED: usize = 1024;
+const MAX_PENDING_RETIRED: usize = 64;
 /// Largest stereo chunk handled per inner pass in `process_device`.
 const SCRATCH_FRAMES: usize = 2048;
 const STATUS_HZ: f32 = 50.0;
 /// Notes played this close before the downbeat are recorded on the downbeat.
 const PRE_ROLL_TICKS: f64 = (PPQ / 4) as f64;
+const CLICK_TRACK: u8 = u8::MAX;
 
 #[derive(Clone, Copy)]
 enum Action {
@@ -32,6 +34,7 @@ enum Action {
 #[derive(Clone, Copy)]
 struct Scheduled {
     offset: usize,
+    track: u8,
     action: Action,
 }
 
@@ -39,9 +42,15 @@ pub struct AudioProcessor {
     sr: f32,
     cmd_rx: Consumer<Command>,
     ev_tx: Producer<Event>,
-    synth: Synth,
+    #[allow(clippy::vec_box)] // boxed so adding/removing a track moves a pointer, not a whole track
+    tracks: Vec<Box<Track>>,
     click: Click,
-    params: ParamSet,
+
+    armed: Option<u32>,
+    overdub: bool,
+    song_end: u64,
+    looping: bool,
+    loop_len: f64,
 
     playing: bool,
     recording: bool,
@@ -53,15 +62,13 @@ pub struct AudioProcessor {
     countin_beats: u8,
     next_beat: i64,
 
-    clip: Box<Clip>,
-    clip_idx: usize,
-    #[allow(clippy::vec_box)] // boxes are what the event queue carries back to the control thread
-    retired: Vec<Box<Clip>>,
-
+    pending: Vec<Retired>,
     sched: [Scheduled; MAX_SCHED],
     sched_len: usize,
 
+    master_target: f32,
     master: f32,
+    metro_vol: f32,
     scratch: Vec<f32>,
 
     frames_since_status: u32,
@@ -76,14 +83,17 @@ impl AudioProcessor {
     pub fn new(sample_rate: u32) -> (Self, Producer<Command>, Consumer<Event>) {
         let (cmd_tx, cmd_rx) = RingBuffer::new(COMMAND_QUEUE);
         let (ev_tx, ev_rx) = RingBuffer::new(EVENT_QUEUE);
-        let params = ParamSet::default();
         let p = Self {
             sr: sample_rate as f32,
             cmd_rx,
             ev_tx,
-            synth: Synth::new(sample_rate as f32),
+            tracks: Vec::with_capacity(MAX_TRACKS),
             click: Click::default(),
-            params,
+            armed: None,
+            overdub: false,
+            song_end: 0,
+            looping: false,
+            loop_len: 0.0,
             playing: false,
             recording: false,
             pos_ticks: 0.0,
@@ -93,15 +103,16 @@ impl AudioProcessor {
             metronome: true,
             countin_beats: 4,
             next_beat: 0,
-            clip: Box::new(Clip::default()),
-            clip_idx: 0,
-            retired: Vec::with_capacity(8),
+            pending: Vec::with_capacity(MAX_PENDING_RETIRED),
             sched: [Scheduled {
                 offset: 0,
+                track: CLICK_TRACK,
                 action: Action::Click { accent: false },
             }; MAX_SCHED],
             sched_len: 0,
-            master: params.get(ParamId::MasterGain),
+            master_target: 0.8,
+            master: 0.8,
+            metro_vol: 0.5,
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
             frames_since_status: 0,
             peak_l: 0.0,
@@ -129,24 +140,30 @@ impl AudioProcessor {
     fn send(&mut self, ev: Event) {
         match self.ev_tx.push(ev) {
             Ok(()) => {}
-            Err(PushError::Full(Event::ClipRetired(b))) => {
-                // Never drop a Box on the audio thread: park it and retry next block.
-                if self.retired.len() < self.retired.capacity() {
-                    self.retired.push(b);
-                } else {
-                    std::mem::forget(b);
-                }
-            }
+            Err(PushError::Full(Event::Retired(r))) => self.park(r),
             Err(PushError::Full(_)) => self.dropped = self.dropped.saturating_add(1),
         }
     }
 
-    fn retry_retired(&mut self) {
-        while let Some(b) = self.retired.pop() {
-            match self.ev_tx.push(Event::ClipRetired(b)) {
+    /// Never drop a boxed object on the audio thread: park it and retry next block.
+    fn park(&mut self, r: Retired) {
+        if self.pending.len() < self.pending.capacity() {
+            self.pending.push(r);
+        } else {
+            std::mem::forget(r);
+        }
+    }
+
+    fn retire(&mut self, r: Retired) {
+        self.send(Event::Retired(r));
+    }
+
+    fn retry_pending(&mut self) {
+        while let Some(r) = self.pending.pop() {
+            match self.ev_tx.push(Event::Retired(r)) {
                 Ok(()) => {}
-                Err(PushError::Full(Event::ClipRetired(b))) => {
-                    self.retired.push(b);
+                Err(PushError::Full(Event::Retired(r))) => {
+                    self.pending.push(r);
                     break;
                 }
                 Err(PushError::Full(_)) => break,
@@ -154,8 +171,22 @@ impl AudioProcessor {
         }
     }
 
+    fn track_mut(&mut self, id: u32) -> Option<&mut Box<Track>> {
+        self.tracks.iter_mut().find(|t| t.id == id)
+    }
+
+    fn refresh_audibility(&mut self) {
+        let any_solo = self.tracks.iter().any(|t| t.solo);
+        for t in self.tracks.iter_mut() {
+            t.audible = !t.mute && (!any_solo || t.solo);
+        }
+    }
+
     fn start_transport(&mut self, record: bool) {
-        self.synth.panic();
+        for t in self.tracks.iter_mut() {
+            t.instrument.panic();
+            t.clip_idx = 0;
+        }
         self.recording = record;
         self.playing = true;
         let countin = if record {
@@ -165,10 +196,10 @@ impl AudioProcessor {
         };
         self.pos_ticks = -countin;
         self.next_beat = (self.pos_ticks / self.beat_ticks()).ceil() as i64;
-        self.clip_idx = 0;
     }
 
-    /// `cut_notes`: fast-release all voices (user stop). Natural end of clip lets them ring out.
+    /// `cut_notes`: fast-release all voices (user stop). Natural end of song flushes the
+    /// remaining clip events (note-offs) instead, so releases ring out.
     fn stop_transport(&mut self, cut_notes: bool) {
         if !self.playing {
             return;
@@ -176,8 +207,16 @@ impl AudioProcessor {
         let was_recording = self.recording;
         self.playing = false;
         self.recording = false;
-        if cut_notes {
-            self.synth.panic();
+        for t in self.tracks.iter_mut() {
+            if cut_notes {
+                t.instrument.panic();
+            } else {
+                while t.clip_idx < t.clip.events.len() {
+                    let ev = t.clip.events[t.clip_idx].event;
+                    t.instrument.handle(ev);
+                    t.clip_idx += 1;
+                }
+            }
         }
         let pos = self.pos_ticks;
         self.send(Event::TransportStopped {
@@ -189,16 +228,142 @@ impl AudioProcessor {
     fn apply_command(&mut self, cmd: Command) {
         match cmd {
             Command::Midi(ev) => {
-                self.synth.handle(ev);
-                if self.playing && self.recording && self.pos_ticks >= -PRE_ROLL_TICKS {
-                    let tick = self.pos_ticks.max(0.0) as u64;
-                    self.send(Event::Recorded { tick, event: ev });
+                let (playing, recording, pos, armed) = (self.playing, self.recording, self.pos_ticks, self.armed);
+                if let Some(id) = armed {
+                    if let Some(t) = self.track_mut(id) {
+                        t.instrument.handle(ev);
+                    }
+                    if playing && recording && pos >= -PRE_ROLL_TICKS {
+                        self.send(Event::Recorded {
+                            track: id,
+                            tick: pos.max(0.0) as u64,
+                            event: ev,
+                        });
+                    }
                 }
             }
-            Command::SetParam(id, v) => {
-                self.params.set(id, v);
-                self.synth.set_param(id, v);
+            Command::AddTrack(t) => {
+                if self.tracks.len() < self.tracks.capacity() {
+                    self.tracks.push(t);
+                    self.refresh_audibility();
+                } else {
+                    self.retire(Retired::Track(t));
+                }
             }
+            Command::RemoveTrack(id) => {
+                if let Some(i) = self.tracks.iter().position(|t| t.id == id) {
+                    let t = self.tracks.remove(i);
+                    if self.armed == Some(id) {
+                        self.armed = None;
+                    }
+                    self.retire(Retired::Track(t));
+                    self.refresh_audibility();
+                }
+            }
+            Command::SetInstrument { track, instrument } => {
+                let mut new = instrument;
+                if let Some(t) = self.track_mut(track) {
+                    std::mem::swap(&mut t.instrument, &mut *new);
+                    self.retire(Retired::Instrument(new));
+                } else {
+                    self.retire(Retired::Instrument(new));
+                }
+            }
+            Command::SetInstrumentParam { track, index, value } => {
+                if let Some(t) = self.track_mut(track) {
+                    t.instrument.set_param(index, value);
+                }
+            }
+            Command::InsertEffect {
+                track,
+                index,
+                effect,
+                bypass,
+            } => {
+                let mut rejected = None;
+                match self.track_mut(track) {
+                    Some(t) if t.effects.len() < t.effects.capacity() => {
+                        let i = index.min(t.effects.len());
+                        t.effects.insert(i, Slot { effect, bypass });
+                    }
+                    _ => rejected = Some(effect),
+                }
+                if let Some(e) = rejected {
+                    self.retire(Retired::Effect(e));
+                }
+            }
+            Command::RemoveEffect { track, index } => {
+                let removed = self
+                    .track_mut(track)
+                    .and_then(|t| (index < t.effects.len()).then(|| t.effects.remove(index)));
+                if let Some(s) = removed {
+                    self.retire(Retired::Effect(s.effect));
+                }
+            }
+            Command::MoveEffect { track, from, to } => {
+                if let Some(t) = self.track_mut(track) {
+                    if from < t.effects.len() && to < t.effects.len() && from != to {
+                        if from < to {
+                            t.effects[from..=to].rotate_left(1);
+                        } else {
+                            t.effects[to..=from].rotate_right(1);
+                        }
+                    }
+                }
+            }
+            Command::SetEffectBypass { track, index, bypass } => {
+                if let Some(s) = self.track_mut(track).and_then(|t| t.effects.get_mut(index)) {
+                    s.bypass = bypass;
+                }
+            }
+            Command::SetEffectParam {
+                track,
+                slot,
+                index,
+                value,
+            } => {
+                if let Some(s) = self.track_mut(track).and_then(|t| t.effects.get_mut(slot)) {
+                    s.effect.set_param(index, value);
+                }
+            }
+            Command::SetMix {
+                track,
+                volume,
+                pan,
+                mute,
+                solo,
+            } => {
+                if let Some(t) = self.track_mut(track) {
+                    t.volume = volume.clamp(0.0, 2.0);
+                    t.pan = pan.clamp(-1.0, 1.0);
+                    t.mute = mute;
+                    t.solo = solo;
+                }
+                self.refresh_audibility();
+            }
+            Command::SetLfo { track, settings } => {
+                if let Some(t) = self.track_mut(track) {
+                    t.lfo = settings;
+                }
+            }
+            Command::LoadClip { track, clip } => {
+                let pos = self.pos_ticks;
+                let mut new = clip;
+                if let Some(t) = self.track_mut(track) {
+                    std::mem::swap(&mut t.clip, &mut new);
+                    t.clip_idx = t.clip.events.partition_point(|e| (e.tick as f64) < pos);
+                }
+                self.retire(Retired::Clip(new));
+            }
+            Command::SetArmed(id) => self.armed = id,
+            Command::SetOverdub(on) => self.overdub = on,
+            Command::SetSongEnd(t) => self.song_end = t,
+            Command::SetLoop { enabled, length_ticks } => {
+                self.looping = enabled;
+                self.loop_len = length_ticks as f64;
+            }
+            Command::SetMasterGain(g) => self.master_target = g.clamp(0.0, 1.5),
+            Command::SetMetronomeVolume(v) => self.metro_vol = v.clamp(0.0, 1.0),
             Command::Play { record } => self.start_transport(record),
             Command::Stop => self.stop_transport(true),
             Command::SetTempo(bpm) => {
@@ -214,26 +379,24 @@ impl AudioProcessor {
             }
             Command::SetMetronome(on) => self.metronome = on,
             Command::SetCountIn(beats) => self.countin_beats = beats.min(16),
-            Command::LoadClip(new) => {
-                let old = std::mem::replace(&mut self.clip, new);
-                let pos = self.pos_ticks;
-                self.clip_idx = self.clip.events.partition_point(|e| (e.tick as f64) < pos);
-                self.send(Event::ClipRetired(old));
+            Command::Panic => {
+                for t in self.tracks.iter_mut() {
+                    t.instrument.panic();
+                }
             }
-            Command::Panic => self.synth.panic(),
         }
     }
 
-    fn push_sched(&mut self, offset: usize, action: Action) {
+    fn push_sched(&mut self, offset: usize, track: u8, action: Action) {
         if self.sched_len < MAX_SCHED {
-            self.sched[self.sched_len] = Scheduled { offset, action };
+            self.sched[self.sched_len] = Scheduled { offset, track, action };
             self.sched_len += 1;
         } else {
             self.dropped = self.dropped.saturating_add(1);
         }
     }
 
-    /// Fills the schedule with metronome clicks and clip events falling in this block.
+    /// Fills the schedule with metronome clicks and clip events falling in this segment.
     fn schedule_block(&mut self, frames: usize) {
         self.sched_len = 0;
         if !self.playing || frames == 0 {
@@ -249,20 +412,30 @@ impl AudioProcessor {
             let t = self.next_beat as f64 * beat_ticks;
             if self.metronome {
                 let accent = self.next_beat.rem_euclid(self.numerator as i64) == 0;
-                self.push_sched(offset_of(t), Action::Click { accent });
+                self.push_sched(offset_of(t), CLICK_TRACK, Action::Click { accent });
             }
             self.next_beat += 1;
         }
 
-        if !self.recording {
-            while self.clip_idx < self.clip.events.len() && (self.clip.events[self.clip_idx].tick as f64) < end {
-                let te = self.clip.events[self.clip_idx];
-                self.push_sched(offset_of(te.tick as f64), Action::Midi(te.event));
-                self.clip_idx += 1;
+        for ti in 0..self.tracks.len() {
+            let silent = self.recording && !self.overdub && self.armed == Some(self.tracks[ti].id);
+            if silent {
+                continue;
+            }
+            loop {
+                let t = &self.tracks[ti];
+                let Some(te) = t.clip.events.get(t.clip_idx).copied() else {
+                    break;
+                };
+                if (te.tick as f64) >= end {
+                    break;
+                }
+                self.tracks[ti].clip_idx += 1;
+                self.push_sched(offset_of(te.tick as f64), ti as u8, Action::Midi(te.event));
             }
         }
 
-        // Stable insertion sort; the schedule is tiny and mostly ordered already.
+        // Stable insertion sort; the schedule is small and mostly ordered already.
         for i in 1..self.sched_len {
             let mut j = i;
             while j > 0 && self.sched[j - 1].offset > self.sched[j].offset {
@@ -272,33 +445,80 @@ impl AudioProcessor {
         }
     }
 
-    fn apply_action(&mut self, action: Action) {
-        match action {
-            Action::Midi(ev) => self.synth.handle(ev),
+    fn apply_action(&mut self, s: Scheduled) {
+        match s.action {
+            Action::Midi(ev) => {
+                if let Some(t) = self.tracks.get_mut(s.track as usize) {
+                    t.instrument.handle(ev);
+                }
+            }
             Action::Click { accent } => self.click.trigger(if accent { 1500.0 } else { 1000.0 }, self.sr),
         }
     }
 
     fn render_range(&mut self, out: &mut [f32], from: usize, to: usize) {
-        let metro_vol = self.params.get(ParamId::MetronomeVolume);
-        let master_target = self.params.get(ParamId::MasterGain);
-        let mut l = [0.0f32; CHUNK];
-        let mut r = [0.0f32; CHUNK];
+        let mut mix_l = [0.0f32; CHUNK];
+        let mut mix_r = [0.0f32; CHUNK];
+        let mut tl = [0.0f32; CHUNK];
+        let mut tr = [0.0f32; CHUNK];
         let mut i = from;
         while i < to {
             let m = (to - i).min(CHUNK);
-            self.synth.render(&mut l[..m], &mut r[..m]);
+            mix_l[..m].fill(0.0);
+            mix_r[..m].fill(0.0);
+            for t in self.tracks.iter_mut() {
+                t.render(&mut tl[..m], &mut tr[..m]);
+                for k in 0..m {
+                    mix_l[k] += tl[k];
+                    mix_r[k] += tr[k];
+                }
+            }
             for k in 0..m {
-                self.master += (master_target - self.master) * 0.003;
-                let c = self.click.tick() * metro_vol * 0.5;
-                let sl = soft_limit((l[k] + c) * self.master);
-                let sr = soft_limit((r[k] + c) * self.master);
+                self.master += (self.master_target - self.master) * 0.003;
+                let c = self.click.tick() * self.metro_vol * 0.5;
+                let sl = soft_limit((mix_l[k] + c) * self.master);
+                let sr = soft_limit((mix_r[k] + c) * self.master);
                 out[(i + k) * 2] = sl;
                 out[(i + k) * 2 + 1] = sr;
                 self.peak_l = self.peak_l.max(sl.abs());
                 self.peak_r = self.peak_r.max(sr.abs());
             }
             i += m;
+        }
+    }
+
+    /// Renders one stretch of audio that does not cross the loop end.
+    fn process_segment(&mut self, out: &mut [f32]) {
+        let frames = out.len() / 2;
+        self.schedule_block(frames);
+        let mut cursor = 0;
+        let mut si = 0;
+        while cursor < frames {
+            while si < self.sched_len && self.sched[si].offset <= cursor {
+                let s = self.sched[si];
+                self.apply_action(s);
+                si += 1;
+            }
+            let end = if si < self.sched_len {
+                self.sched[si].offset.min(frames)
+            } else {
+                frames
+            };
+            self.render_range(out, cursor, end);
+            cursor = end;
+        }
+        if self.playing {
+            self.pos_ticks += frames as f64 * self.ticks_per_sample();
+        }
+    }
+
+    fn wrap_loop(&mut self) {
+        self.pos_ticks = (self.pos_ticks - self.loop_len).max(0.0);
+        self.next_beat = ((self.pos_ticks - 1e-6) / self.beat_ticks()).ceil() as i64;
+        let pos = self.pos_ticks;
+        for t in self.tracks.iter_mut() {
+            t.instrument.panic();
+            t.clip_idx = t.clip.events.partition_point(|e| (e.tick as f64) < pos);
         }
     }
 
@@ -310,35 +530,32 @@ impl AudioProcessor {
         while let Ok(cmd) = self.cmd_rx.pop() {
             self.apply_command(cmd);
         }
-        self.retry_retired();
-        self.schedule_block(frames);
+        self.retry_pending();
 
-        let mut cursor = 0;
-        let mut si = 0;
-        while cursor < frames {
-            while si < self.sched_len && self.sched[si].offset <= cursor {
-                let a = self.sched[si].action;
-                self.apply_action(a);
-                si += 1;
+        let mut done = 0;
+        while done < frames {
+            let mut seg = frames - done;
+            let loop_active = self.playing && self.looping && self.loop_len > 0.0 && self.pos_ticks >= 0.0;
+            if loop_active {
+                let remaining = ((self.loop_len - self.pos_ticks) / self.ticks_per_sample())
+                    .ceil()
+                    .max(1.0) as usize;
+                seg = seg.min(remaining);
             }
-            let end = if si < self.sched_len {
-                self.sched[si].offset.min(frames)
-            } else {
-                frames
-            };
-            self.render_range(out, cursor, end);
-            cursor = end;
+            self.process_segment(&mut out[done * 2..(done + seg) * 2]);
+            done += seg;
+            if loop_active && self.pos_ticks >= self.loop_len - 1e-6 {
+                self.wrap_loop();
+            }
         }
 
-        if self.playing {
-            self.pos_ticks += frames as f64 * self.ticks_per_sample();
-            if !self.recording
-                && self.clip.length_ticks > 0
-                && self.pos_ticks >= self.clip.length_ticks as f64
-                && self.clip_idx >= self.clip.events.len()
-            {
-                self.stop_transport(false);
-            }
+        if self.playing
+            && !self.looping
+            && !self.recording
+            && self.song_end > 0
+            && self.pos_ticks >= self.song_end as f64
+        {
+            self.stop_transport(false);
         }
 
         let budget = frames as f32 / self.sr;
@@ -347,16 +564,29 @@ impl AudioProcessor {
         }
         self.frames_since_status += frames as u32;
         if self.frames_since_status as f32 >= self.sr / STATUS_HZ {
-            let snap = StatusSnapshot {
+            let mut snap = StatusSnapshot {
                 position_ticks: self.pos_ticks,
                 peak_l: self.peak_l,
                 peak_r: self.peak_r,
                 load: self.max_load,
-                voices: self.synth.active_voices() as u8,
+                voices: 0,
                 playing: self.playing,
                 recording: self.recording,
                 counting_in: self.playing && self.pos_ticks < 0.0,
+                track_count: self.tracks.len() as u8,
+                tracks: [TrackMeter::default(); MAX_TRACKS],
             };
+            let mut voices = 0usize;
+            for (i, t) in self.tracks.iter_mut().enumerate() {
+                let (l, r) = t.take_peaks();
+                snap.tracks[i] = TrackMeter {
+                    id: t.id,
+                    peak_l: l,
+                    peak_r: r,
+                };
+                voices += t.instrument.active_voices();
+            }
+            snap.voices = voices.min(255) as u8;
             self.send(Event::Status(snap));
             self.frames_since_status = 0;
             self.peak_l = 0.0;

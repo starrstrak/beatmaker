@@ -2,7 +2,7 @@
 
 use crate::dsp::{Adsr, Svf, Waveform};
 use crate::midi::{MidiEvent, CC_ALL_NOTES_OFF, CC_MOD_WHEEL, CC_SUSTAIN};
-use crate::params::{ParamId, ParamSet};
+use crate::params::{ParamId, ParamValues, SUB_PARAMS};
 
 pub const MAX_VOICES: usize = 16;
 /// Render granularity: filter coefficients and pitch modulation update once per chunk.
@@ -29,7 +29,7 @@ struct Voice {
 
 pub struct Synth {
     sample_rate: f32,
-    params: ParamSet,
+    params: ParamValues,
     voices: [Voice; MAX_VOICES],
     bend: f32,
     mod_wheel: f32,
@@ -39,6 +39,8 @@ pub struct Synth {
     counter: u64,
     ctrl_pos: usize,
     pitch_mul: f32,
+    mod_pitch: f32,
+    mod_cutoff: f32,
 }
 
 #[inline]
@@ -50,7 +52,7 @@ impl Synth {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             sample_rate,
-            params: ParamSet::default(),
+            params: ParamValues::defaults(&SUB_PARAMS),
             voices: [Voice::default(); MAX_VOICES],
             bend: 0.0,
             mod_wheel: 0.0,
@@ -60,11 +62,19 @@ impl Synth {
             counter: 0,
             ctrl_pos: 0,
             pitch_mul: 1.0,
+            mod_pitch: 0.0,
+            mod_cutoff: 0.0,
         }
     }
 
-    pub fn set_param(&mut self, id: ParamId, value: f32) {
-        self.params.set(id, value);
+    pub fn set_param(&mut self, index: usize, value: f32) {
+        self.params.set(&SUB_PARAMS, index, value);
+    }
+
+    /// Extra pitch (semitones) and brightness (octaves of filter cutoff) from track modulation.
+    pub fn set_modulation(&mut self, pitch_st: f32, cutoff_oct: f32) {
+        self.mod_pitch = pitch_st;
+        self.mod_cutoff = cutoff_oct;
     }
 
     pub fn active_voices(&self) -> usize {
@@ -210,14 +220,15 @@ impl Synth {
         }
         let lfo = (std::f32::consts::TAU * self.lfo_phase).sin();
         let vibrato_st = lfo * p.get(ParamId::ModDepth) * (self.mod_wheel + 0.35 * self.pressure);
-        self.pitch_mul = ((self.bend * p.get(ParamId::BendRange) + vibrato_st) / 12.0).exp2();
+        self.pitch_mul = ((self.bend * p.get(ParamId::BendRange) + vibrato_st + self.mod_pitch) / 12.0).exp2();
         let (cutoff, res, env_amt) = (
             p.get(ParamId::Cutoff),
             p.get(ParamId::Resonance),
             p.get(ParamId::FilterEnvAmount),
         );
         for v in self.voices.iter_mut().filter(|v| v.active) {
-            v.svf.set(cutoff * (env_amt * v.flt.level()).exp2(), res, sr);
+            v.svf
+                .set(cutoff * (env_amt * v.flt.level() + self.mod_cutoff).exp2(), res, sr);
         }
     }
 
@@ -249,12 +260,13 @@ impl Synth {
         let level2 = p.get(ParamId::Osc2Level);
         let norm = 1.0 / (1.0 + level2);
         let pitch_mul = self.pitch_mul;
+        let level = p.get(ParamId::Level);
 
         for v in self.voices.iter_mut().filter(|v| v.active) {
             let hz = v.base_hz * pitch_mul;
             let dt1 = (hz / sr).min(0.45);
             let dt2 = (hz * detune_mul / sr).min(0.45);
-            let vgain = v.velocity * VOICE_GAIN;
+            let vgain = v.velocity * VOICE_GAIN * level;
             for i in 0..left.len() {
                 v.flt.tick();
                 let amp = v.amp.tick();

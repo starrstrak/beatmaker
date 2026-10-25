@@ -173,6 +173,7 @@ pub struct Svf {
     a1: f32,
     a2: f32,
     a3: f32,
+    k: f32,
 }
 
 impl Svf {
@@ -180,6 +181,7 @@ impl Svf {
         let fc = cutoff_hz.clamp(20.0, sr * 0.45);
         let g = (PI * fc / sr).tan();
         let k = 2.0 - 1.98 * resonance.clamp(0.0, 1.0);
+        self.k = k;
         self.a1 = 1.0 / (1.0 + g * (g + k));
         self.a2 = g * self.a1;
         self.a3 = g * self.a2;
@@ -192,12 +194,18 @@ impl Svf {
 
     #[inline]
     pub fn process_lp(&mut self, x: f32) -> f32 {
+        self.process_all(x).0
+    }
+
+    /// Returns (low-pass, band-pass, high-pass).
+    #[inline]
+    pub fn process_all(&mut self, x: f32) -> (f32, f32, f32) {
         let v3 = x - self.ic2;
         let v1 = self.a1 * self.ic1 + self.a2 * v3;
         let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
         self.ic1 = flush_denormal(2.0 * v1 - self.ic1);
         self.ic2 = flush_denormal(2.0 * v2 - self.ic2);
-        v2
+        (v2, v1, x - self.k * v1 - v2)
     }
 }
 

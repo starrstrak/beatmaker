@@ -1,11 +1,11 @@
 //! Offline rendering and WAV export. Runs the exact same processor as live playback,
 //! so what you hear is what you export, at any sample rate (44.1 kHz .. 192 kHz).
 
-use crate::clip::Clip;
+use crate::clip::{Clip, TimedEvent};
 use crate::messages::Command;
 use crate::midi::MidiEvent;
-use crate::params::ParamSet;
 use crate::processor::AudioProcessor;
+use crate::project::{build_track, Project};
 use crate::PPQ;
 use std::path::Path;
 
@@ -20,7 +20,7 @@ pub enum BitDepth {
 pub struct ExportOptions {
     pub sample_rate: u32,
     pub bit_depth: BitDepth,
-    /// Extra time after the clip end so releases and tails are not cut.
+    /// Extra time after the song end so releases and tails (reverb, delay) are not cut.
     pub tail_seconds: f32,
     /// TPDF dither, applied for 16/24-bit output only.
     pub dither: bool,
@@ -31,7 +31,7 @@ impl Default for ExportOptions {
         Self {
             sample_rate: 48_000,
             bit_depth: BitDepth::Pcm24,
-            tail_seconds: 2.0,
+            tail_seconds: 3.0,
             dither: true,
         }
     }
@@ -52,12 +52,10 @@ pub struct Timing {
     pub denominator: u8,
 }
 
-/// Renders the clip through the synth to interleaved stereo f32.
-pub fn render_clip(clip: &Clip, params: &ParamSet, timing: Timing, sample_rate: u32, tail_seconds: f32) -> Vec<f32> {
+/// Renders every track of the project to interleaved stereo f32 (no metronome, no count-in).
+pub fn render_project(project: &Project, timing: Timing, master: f32, sample_rate: u32, tail_seconds: f32) -> Vec<f32> {
     let (mut proc, mut tx, mut rx) = AudioProcessor::new(sample_rate);
-    for (id, v) in params.iter() {
-        let _ = tx.push(Command::SetParam(id, v));
-    }
+    let _ = tx.push(Command::SetMasterGain(master));
     let _ = tx.push(Command::SetTempo(timing.bpm));
     let _ = tx.push(Command::SetTimeSignature {
         numerator: timing.numerator,
@@ -65,11 +63,15 @@ pub fn render_clip(clip: &Clip, params: &ParamSet, timing: Timing, sample_rate: 
     });
     let _ = tx.push(Command::SetMetronome(false));
     let _ = tx.push(Command::SetCountIn(0));
-    let _ = tx.push(Command::LoadClip(Box::new(clip.clone())));
+    for t in &project.tracks {
+        let _ = tx.push(Command::AddTrack(build_track(t, sample_rate as f32)));
+    }
+    let song_end = project.song_end();
+    let _ = tx.push(Command::SetSongEnd(song_end));
     let _ = tx.push(Command::Play { record: false });
 
     let tps = timing.bpm as f64 * PPQ as f64 / (60.0 * sample_rate as f64);
-    let total = (clip.length_ticks as f64 / tps + tail_seconds as f64 * sample_rate as f64).ceil() as usize;
+    let total = (song_end as f64 / tps + tail_seconds as f64 * sample_rate as f64).ceil() as usize;
     let mut out = Vec::with_capacity(total * 2);
     let mut block = vec![0.0f32; 512 * 2];
     while out.len() < total * 2 {
@@ -134,9 +136,8 @@ pub fn write_wav(
     })
 }
 
-/// Convenience for the CLI/tests: a clip with a repeated chord pattern.
+/// Convenience for the CLI/tests: a four-bar chord loop.
 pub fn demo_clip() -> Clip {
-    use crate::clip::TimedEvent;
     let mut events = Vec::new();
     let chords: [[u8; 3]; 4] = [[57, 60, 64], [53, 57, 60], [48, 52, 55], [55, 59, 62]];
     for (bar, chord) in chords.iter().enumerate() {
@@ -164,5 +165,43 @@ pub fn demo_clip() -> Clip {
     Clip {
         events,
         length_ticks: PPQ as u64 * 16,
+    }
+}
+
+/// Four-on-the-floor drum pattern (kick, snare, closed hats) over `bars` bars.
+pub fn demo_drums(bars: u64) -> Clip {
+    let mut events = Vec::new();
+    let beat = PPQ as u64;
+    for b in 0..bars * 4 {
+        let t = b * beat;
+        let mut hit = |tick: u64, note: u8, vel: u8| {
+            events.push(TimedEvent {
+                tick,
+                event: MidiEvent::NoteOn {
+                    channel: 9,
+                    note,
+                    velocity: vel,
+                },
+            });
+            events.push(TimedEvent {
+                tick: tick + 60,
+                event: MidiEvent::NoteOff {
+                    channel: 9,
+                    note,
+                    velocity: 0,
+                },
+            });
+        };
+        hit(t, 36, 110);
+        if b % 2 == 1 {
+            hit(t, 38, 100);
+        }
+        hit(t, 42, 80);
+        hit(t + beat / 2, 42, 60);
+    }
+    events.sort_by_key(|e| e.tick);
+    Clip {
+        events,
+        length_ticks: bars * 4 * beat,
     }
 }

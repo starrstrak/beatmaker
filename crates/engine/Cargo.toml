@@ -9,3 +9,6 @@ description = "Real-time audio engine: synth, transport, MIDI record/playback, o
 rtrb = "0.3"
 hound = "3.5"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

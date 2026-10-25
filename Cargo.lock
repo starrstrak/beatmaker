@@ -135,6 +135,7 @@ dependencies = [
  "hound",
  "rtrb",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -4,7 +4,8 @@
 //!   bmk demo out.wav [rate] [bits]    render a demo chord loop offline (bits: 16|24|32)
 //!   bmk live [--device N] [--rate N] [--buffer N]   play/record with your MIDI keyboard
 
-use beatmaker_engine::render::{demo_clip, BitDepth, ExportOptions};
+use beatmaker_engine::quantize::QuantizeSettings;
+use beatmaker_engine::render::{demo_clip, demo_drums, BitDepth, ExportOptions};
 use beatmaker_engine::session::Session;
 use beatmaker_io::{list_output_devices, lock, AudioOptions, AudioService, MidiService};
 use std::io::BufRead;
@@ -48,8 +49,10 @@ fn demo(args: &[String]) -> Result<(), String> {
     let out = args.first().ok_or("usage: bmk demo out.wav [rate] [bits]")?;
     let rate = args.get(1).and_then(|r| r.parse().ok()).unwrap_or(48_000);
     let depth = depth_from(args.get(2).map(String::as_str).unwrap_or("24"));
-    let mut s = Session::new();
-    s.set_clip(demo_clip());
+    let mut s = Session::with_starter_project();
+    let ids: Vec<u32> = s.project().tracks.iter().map(|t| t.id).collect();
+    s.set_clip(ids[0], demo_clip());
+    s.set_clip(ids[2], demo_drums(4));
     let rep = s.export_wav(
         Path::new(out),
         &ExportOptions {
@@ -74,7 +77,7 @@ fn live(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown option {other}")),
         }
     }
-    let session = Arc::new(Mutex::new(Session::new()));
+    let session = Arc::new(Mutex::new(Session::with_starter_project()));
     let midi = MidiService::spawn(lock(&session).sender());
     let audio = AudioService::spawn();
     let info = audio.start(opts, session.clone())?;
@@ -88,13 +91,10 @@ fn live(args: &[String]) -> Result<(), String> {
             while !q.load(Ordering::Relaxed) {
                 let mut g = lock(&s);
                 g.poll();
-                if g.clip_version() != version {
-                    version = g.clip_version();
-                    println!(
-                        "[take ready: {} notes, {} ticks]",
-                        g.notes().len(),
-                        g.clip().length_ticks
-                    );
+                if g.version() != version {
+                    version = g.version();
+                    let n = g.armed().map(|id| g.notes(id).len()).unwrap_or(0);
+                    println!("[project changed: armed track has {n} notes]");
                 }
                 drop(g);
                 std::thread::sleep(Duration::from_millis(20));
@@ -102,7 +102,7 @@ fn live(args: &[String]) -> Result<(), String> {
         })
     };
 
-    println!("Play your keyboard. Commands: r=record p=play s=stop t <bpm> m=metronome c <beats> e <file.wav> i=info n=notes q=quit");
+    println!("Play your keyboard (goes to the armed track). Commands: l=tracks a <n>=arm track n r=record p=play s=stop z <div>=quantise armed track to 1/div u=undo t <bpm> m=metronome c <beats> e <file.wav> i=info n=notes q=quit");
     for line in std::io::stdin().lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
         let mut parts = line.split_whitespace();
@@ -128,8 +128,44 @@ fn live(args: &[String]) -> Result<(), String> {
                 Ok(r) => println!("exported {f}: {:.1}s peak {:.2}", r.seconds, r.peak),
                 Err(e) => println!("export failed: {e}"),
             },
+            (Some("l"), _) => {
+                for (i, t) in s.project().tracks.iter().enumerate() {
+                    println!(
+                        "  {}: {} ({:?}){}",
+                        i + 1,
+                        t.name,
+                        t.instrument,
+                        if s.armed() == Some(t.id) { "  <- armed" } else { "" }
+                    );
+                }
+            }
+            (Some("a"), Some(n)) => {
+                let id = n
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| s.project().tracks.get(n.wrapping_sub(1)).map(|t| t.id));
+                if let Some(id) = id {
+                    s.arm(id);
+                }
+            }
+            (Some("z"), Some(d)) => {
+                if let Some(id) = s.armed() {
+                    s.set_quantize(
+                        id,
+                        QuantizeSettings {
+                            division: d.parse().unwrap_or(16),
+                            ..Default::default()
+                        },
+                    );
+                    match s.quantize_track(id) {
+                        Ok(()) => println!("quantised to 1/{d}"),
+                        Err(e) => println!("{e}"),
+                    }
+                }
+            }
+            (Some("u"), _) => println!("undo: {}", s.undo()),
             (Some("n"), _) => {
-                for n in s.notes() {
+                for n in s.armed().map(|id| s.notes(id)).unwrap_or_default() {
                     println!("  note {} {}..{} vel {}", n.note, n.start_tick, n.end_tick, n.velocity);
                 }
             }
