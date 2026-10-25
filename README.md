@@ -5,7 +5,15 @@ Voir `docs/ARCHITECTURE.md` (architecture) et `docs/ROADMAP.md` (phases).
 
 **État : Phase 0 + Phase 1 (MVP)** : jouer au clavier MIDI, enregistrer avec métronome et décompte, réécouter, exporter en WAV.
 
-## Installation (macOS, Apple Silicon)
+## Démarrage rapide (macOS)
+
+```sh
+./scripts/mac-setup.sh --run   # installe ce qui manque, teste, génère diagnostic.txt, lance l'app
+```
+
+Colle le contenu de `diagnostic.txt` dans la conversation. Détail manuel ci-dessous.
+
+## Installation manuelle (macOS, Apple Silicon)
 
 ```sh
 xcode-select --install                                   # outils de compilation Apple

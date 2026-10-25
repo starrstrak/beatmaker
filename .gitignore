@@ -3,3 +3,5 @@ node_modules/
 .DS_Store
 src-tauri/gen/
 *.autosave
+demo.wav
+diagnostic.txt
