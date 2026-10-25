@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="fr" data-theme="dark" data-mode="beginner">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BeatMaker</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">▮▮▮</span> BeatMaker <small>Phase 1 · MVP</small></div>
+  <div class="spacer"></div>
+  <div class="seg" role="group" aria-label="Mode">
+    <button id="mode-beginner" class="active" title="Interface simplifiée : seulement l'essentiel">Débutant</button>
+    <button id="mode-pro" title="Tous les réglages sont visibles">Pro</button>
+  </div>
+  <button id="theme" class="ghost" title="Basculer thème sombre / clair">◐ Thème</button>
+</header>
+
+<section class="transport">
+  <button id="btn-rec" class="rec" title="Enregistrer (touche 1). Un décompte est joué avant le début.">● Enregistrer</button>
+  <button id="btn-play" title="Lecture de la prise (Espace)">▶ Lecture</button>
+  <button id="btn-stop" title="Arrêter (Échap)">■ Stop</button>
+  <div class="time" id="time" title="Position : mesure.temps">1 . 1</div>
+  <label title="Vitesse du morceau en battements par minute">Tempo
+    <input id="tempo" type="number" min="20" max="300" value="120"> BPM</label>
+  <label class="pro" title="Signature rythmique : nombre de temps par mesure">Mesure
+    <input id="num" type="number" min="1" max="16" value="4"> /
+    <select id="den"><option>2</option><option selected>4</option><option>8</option><option>16</option></select></label>
+  <label title="Nombre de temps de métronome avant le début de l'enregistrement">Décompte
+    <input id="countin" type="number" min="0" max="16" value="4"></label>
+  <label class="check" title="Clic régulier pour jouer en rythme"><input id="metro" type="checkbox" checked> Métronome</label>
+</section>
+
+<main class="grid">
+  <section class="panel setup">
+    <h2>Son et clavier</h2>
+    <div class="field">
+      <label for="dev" title="La carte son ou la sortie qui joue le son">Sortie audio</label>
+      <select id="dev"></select>
+    </div>
+    <div class="field">
+      <label for="rate" title="Qualité du son. 48 000 Hz convient à presque tout.">Fréquence</label>
+      <select id="rate"></select>
+    </div>
+    <div class="field">
+      <label for="buf" title="Petit = réponse rapide mais plus risque de craquements. Grand = plus sûr mais retardé.">Taille du tampon</label>
+      <select id="buf">
+        <option value="">Auto</option><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option>
+      </select>
+    </div>
+    <button id="apply-audio" class="primary">Appliquer / démarrer l'audio</button>
+    <p id="audio-status" class="status">Audio arrêté.</p>
+    <div class="midi">
+      <h3>Clavier MIDI <span id="midi-led" class="led" title="S'allume quand un message MIDI arrive"></span></h3>
+      <p id="midi-status" class="status">Recherche…</p>
+      <p id="midi-last" class="status small"></p>
+    </div>
+    <details class="help">
+      <summary>Pas de clavier MIDI ? Utilise le clavier de l'ordinateur</summary>
+      <p>Rangée du milieu = touches blanches, rangée du dessus = touches noires (positions physiques d'un clavier QWERTY).
+      <b>Z / X</b> : octave − / +. <b>C / V</b> : vélocité − / +. <b>Alt</b> maintenu = pédale de sustain.</p>
+    </details>
+  </section>
+
+  <section class="panel clip">
+    <h2>Prise MIDI <span id="clip-info" class="status small"></span></h2>
+    <canvas id="roll" width="900" height="260"></canvas>
+    <p class="hint" id="hint">1) Applique l'audio · 2) Joue quelques notes · 3) Clique sur « Enregistrer » · 4) « Stop » · 5) « Lecture » · 6) Exporte en WAV.</p>
+  </section>
+
+  <section class="panel meters">
+    <h2>Niveaux</h2>
+    <div class="meter"><div id="mL"></div></div>
+    <div class="meter"><div id="mR"></div></div>
+    <p class="status small" title="Part de temps de calcul utilisée. Au-dessus de 100 % : craquements.">Charge audio : <span id="load">0</span> % · Voix : <span id="voices">0</span></p>
+    <h3>Exporter</h3>
+    <div class="field"><label for="xrate">Fréquence</label>
+      <select id="xrate"><option>44100</option><option selected>48000</option><option>96000</option><option>192000</option></select></div>
+    <div class="field"><label for="xbits">Profondeur</label>
+      <select id="xbits"><option value="16">16 bits</option><option value="24" selected>24 bits</option><option value="32">32 bits (flottant)</option></select></div>
+    <label class="check pro" title="Bruit très faible qui masque les défauts de la réduction à 16/24 bits"><input id="xdither" type="checkbox" checked> Dithering</label>
+    <button id="btn-export" class="primary">Exporter en WAV</button>
+    <p id="export-status" class="status small"></p>
+  </section>
+
+  <section class="panel synth">
+    <h2>Synthétiseur soustractif</h2>
+    <div id="synth-controls" class="controls"></div>
+  </section>
+
+  <section class="panel keys">
+    <div class="keys-head"><span>Octave de base : <b id="oct">C3</b></span> <span>Vélocité : <b id="vel">100</b></span></div>
+    <div id="piano" class="piano"></div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

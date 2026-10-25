@@ -1,0 +1,11 @@
+[package]
+name = "beatmaker-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Real-time audio engine: synth, transport, MIDI record/playback, offline render."
+
+[dependencies]
+rtrb = "0.3"
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }

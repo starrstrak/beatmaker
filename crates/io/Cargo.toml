@@ -1,0 +1,16 @@
+[package]
+name = "beatmaker-io"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Audio device (cpal) and MIDI input (midir) services for the engine."
+
+[dependencies]
+beatmaker-engine = { path = "../engine" }
+cpal = "0.15"
+midir = "0.10"
+serde = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "bmk"
+path = "src/bin/bmk.rs"

@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/io", "src-tauri"]
+# src-tauri needs system WebView libs; build it explicitly with `cargo tauri dev`.
+default-members = ["crates/engine", "crates/io"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+# Real-time audio is unusable at opt-level 0; keep dev builds fast enough to run.
+opt-level = 2
